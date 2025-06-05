@@ -84,17 +84,14 @@ kernel void mineKernel(const device uint* midstate,
                        const device uint8_t* target,
                        device atomic_uint* outputNonce,
                        device uint8_t* resultHashes,
-                       constant uint& nonceBase, // ✅ NEW ARG at index 5
+                       constant uint& nonceBase,
                        uint thread_id [[thread_position_in_grid]]) {
 
-    // ✅ Correct nonce based on batch offset
     uint nonce = nonceBase + thread_id;
 
-    // Run SHA256 compression
     uint hash[8];
     sha256_compress(midstate, tail, nonce, hash);
 
-    // Convert hash words to bytes
     uint8_t hashBytes[32];
     for (int i = 0; i < 8; i++) {
         hashBytes[i*4 + 0] = (hash[i] >> 24) & 0xFF;
@@ -103,14 +100,12 @@ kernel void mineKernel(const device uint* midstate,
         hashBytes[i*4 + 3] = hash[i] & 0xFF;
     }
 
-    // ✅ Always write thread 0's hash for sample display
     if (thread_id == 0) {
         for (uint i = 0; i < 32; i++) {
             resultHashes[i] = hashBytes[i];
         }
     }
 
-    // Check hash against target
     bool isValid = true;
     for (int i = 0; i < 32; i++) {
         if (hashBytes[i] > target[i]) {
@@ -120,7 +115,6 @@ kernel void mineKernel(const device uint* midstate,
         if (hashBytes[i] < target[i]) break;
     }
 
-    // ✅ Write valid hash to result buffer (thread-specific offset)
     if (isValid) {
         if (atomic_exchange_explicit(outputNonce, nonce, memory_order_relaxed) == 0) {
             for (uint i = 0; i < 32; i++) {

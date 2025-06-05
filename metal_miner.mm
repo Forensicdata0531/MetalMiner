@@ -63,7 +63,6 @@ bool metalMineBlock(const BlockHeader& header,
     const uint32_t threads = 131072;
     totalHashesTried = threads;
 
-    // ➤ Buffer: nonceBase
     uint32_t nonceBase = initialNonceBase;
     id<MTLBuffer> nonceBaseBuf = [device newBufferWithBytes:&nonceBase
                                                      length:sizeof(uint32_t)
@@ -87,7 +86,7 @@ bool metalMineBlock(const BlockHeader& header,
     [encoder setBuffer:targetBuffer offset:0 atIndex:2];
     [encoder setBuffer:resultNonceBuf offset:0 atIndex:3];
     [encoder setBuffer:resultHashes offset:0 atIndex:4];
-    [encoder setBuffer:nonceBaseBuf offset:0 atIndex:5]; // ➤ new binding
+    [encoder setBuffer:nonceBaseBuf offset:0 atIndex:5];
 
     MTLSize gridSize = MTLSizeMake(threads, 1, 1);
     NSUInteger threadGroupSize = pipelineState.maxTotalThreadsPerThreadgroup;
@@ -111,7 +110,7 @@ bool metalMineBlock(const BlockHeader& header,
         return true;
     } else {
         validNonce = 0;
-        validHash.assign(hashStart, hashStart + 32); // sample hash from thread 0
+        validHash.assign(hashStart, hashStart + 32);
         return false;
     }
 }
