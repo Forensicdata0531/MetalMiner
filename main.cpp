@@ -2,12 +2,11 @@
 #include "block.hpp"
 #include "midstate_utils.hpp"
 #include "metal_ui.hpp"
+#include "metal_miner.hpp"  // Include the Metal miner header
 #include <iostream>
 #include <chrono>
 #include <thread>
 #include <climits>
-#include <atomic>
-#include <mutex>
 #include <fstream>
 #include <sstream>
 #include "nlohmann/json.hpp"
@@ -16,7 +15,29 @@ using json = nlohmann::json;
 
 MiningStats stats;
 
-// Utility: Convert hex string (big-endian) to bytes vector
+// Converts bytes to hex string (for sample hash display)
+std::string toHex(const std::vector<uint8_t>& data) {
+    static const char* digits = "0123456789abcdef";
+    std::string output;
+    output.reserve(data.size() * 2);
+    for (uint8_t byte : data) {
+        output.push_back(digits[byte >> 4]);
+        output.push_back(digits[byte & 0xF]);
+    }
+    return output;
+}
+
+std::string toHex(const std::array<uint8_t, 32>& data) {
+    static const char* digits = "0123456789abcdef";
+    std::string output;
+    output.reserve(data.size() * 2);
+    for (uint8_t byte : data) {
+        output.push_back(digits[byte >> 4]);
+        output.push_back(digits[byte & 0xF]);
+    }
+    return output;
+}
+
 std::vector<uint8_t> hexToBytes(const std::string& hex) {
     std::vector<uint8_t> bytes;
     bytes.reserve(hex.length() / 2);
@@ -27,7 +48,6 @@ std::vector<uint8_t> hexToBytes(const std::string& hex) {
     return bytes;
 }
 
-// Load file contents into string
 std::string loadFile(const std::string& filename) {
     std::ifstream file(filename);
     if (!file) throw std::runtime_error("Failed to open " + filename);
@@ -36,40 +56,49 @@ std::string loadFile(const std::string& filename) {
     return buffer.str();
 }
 
-// Copy big-endian hex string to little-endian 32-byte array
 void copyHashLE(const std::string& hexStr, std::array<uint8_t, 32>& outArray) {
     auto bytes = hexToBytes(hexStr);
     if (bytes.size() != 32) throw std::runtime_error("Invalid hash length");
-    std::reverse(bytes.begin(), bytes.end()); // Convert big-endian to little-endian
+    std::reverse(bytes.begin(), bytes.end());
     std::copy(bytes.begin(), bytes.end(), outArray.begin());
 }
 
-// Mining dispatch stub using midstate for CPU (for testing, not GPU)
-void dispatchMining(const BlockHeader& header, const std::array<uint32_t, 8>& midstate, const std::vector<uint8_t>& tail, const std::vector<uint8_t>& target, MiningStats& stats) {
-    for (uint32_t nonce = 0; nonce < UINT32_MAX && !stats.quit.load(std::memory_order_acquire); ++nonce) {
-        // Construct full block header tail with nonce in little endian
-        std::vector<uint8_t> blockTail = tail;
-        blockTail[12] = (nonce >> 0) & 0xFF;
-        blockTail[13] = (nonce >> 8) & 0xFF;
-        blockTail[14] = (nonce >> 16) & 0xFF;
-        blockTail[15] = (nonce >> 24) & 0xFF;
+// Updated dispatchMining calls your Metal miner and updates stats
+void dispatchMining(const BlockHeader& header,
+                    const std::array<uint32_t, 8>& midstate,
+                    const std::vector<uint8_t>& tail,
+                    const std::vector<uint8_t>& target,
+                    MiningStats& stats) {
+    (void)midstate; // unused param warning suppression
+    (void)tail;
 
-        // Compute double SHA256 of (midstate + tail)
-        // For illustration, here we call sha256 twice on concatenated data
-        // A real miner uses optimized midstate reuse (left as exercise)
+    uint32_t nonceBase = 0;
+    uint32_t validNonce = 0;
+    std::vector<uint8_t> validHash(32, 0);
+    uint64_t totalHashesTried = 0;
 
-        // Concatenate midstate bytes (32 bytes) + blockTail (64 bytes)
-        // But midstate is already mid-hash state; in this stub, we compute normally.
+    const int maxBatches = 1000;
 
-        // Build full 80-byte block header (32 bytes prefix, 48 bytes tail)
-        // Here, assume midstate covers first 64 bytes, tail is last 16 bytes.
-        // This is simplified for demonstration.
+    for (int batch = 0; batch < maxBatches && !stats.quit.load(std::memory_order_acquire); batch++) {
+        bool found = metalMineBlock(header, target, nonceBase, validNonce, validHash, totalHashesTried);
 
-        // Not a real mining function - just a placeholder
-        stats.hashes++;
-        if (nonce % 1000000 == 0) {
-            std::cout << "Tried nonce " << nonce << "\n";
+        stats.hashes += totalHashesTried;
+
+        std::copy(validHash.begin(), validHash.end(), stats.sampleHash.begin());
+        stats.sampleHashStr = toHex(stats.sampleHash);
+
+        std::cout << "Batch " << batch << " tried " << totalHashesTried << " hashes, total " << stats.hashes.load() << "\n";
+        std::cout << "Sample Hash: " << stats.sampleHashStr << "\n";
+
+        if (found) {
+            stats.validNonce = validNonce;
+            stats.validHashStr = toHex(validHash);
+            std::cout << ">>> Valid nonce found: " << validNonce << "\n";
+            std::cout << ">>> Valid hash: " << stats.validHashStr << "\n";
+            break;
         }
+
+        nonceBase += (uint32_t)totalHashesTried;
     }
 }
 
@@ -87,12 +116,10 @@ int main(int argc, char** argv) {
         std::string hashMerkleRootBE = tmpl["merkleroot"];
         std::string hashTargetBE = tmpl["target"];
         uint32_t nTime = tmpl["curtime"];
-        uint32_t nBits = tmpl["bits"];
         uint32_t nVersion = tmpl["version"];
-        uint32_t nHeight = tmpl["height"];
+        std::string bitsHex = tmpl["bits"];
         uint32_t nNonce = 0;
 
-        // Copy hashes to little-endian arrays
         std::array<uint8_t, 32> prevBlock;
         std::array<uint8_t, 32> merkleRoot;
         std::array<uint8_t, 32> target;
@@ -101,22 +128,26 @@ int main(int argc, char** argv) {
         copyHashLE(hashMerkleRootBE, merkleRoot);
         copyHashLE(hashTargetBE, target);
 
+        uint32_t nBits = 0;
+        for (int i = 0; i < 4; ++i) {
+            std::string byteStr = bitsHex.substr(i * 2, 2);
+            nBits |= static_cast<uint32_t>(std::stoi(byteStr, nullptr, 16)) << (8 * (3 - i));
+        }
+
         BlockHeader header;
         header.version = nVersion;
-        std::copy(prevBlock.begin(), prevBlock.end(), header.prevBlock.begin());
+        std::copy(prevBlock.begin(), prevBlock.end(), header.prevBlockHash.begin());
         std::copy(merkleRoot.begin(), merkleRoot.end(), header.merkleRoot.begin());
         header.timestamp = nTime;
         header.bits = nBits;
         header.nonce = nNonce;
 
-        // Compute midstate and tail for mining
         std::array<uint32_t, 8> midstate = midstateFromHeader(header);
         std::vector<uint8_t> tail = tailFromHeader(header);
+        std::vector<uint8_t> targetVec(target.begin(), target.end());
 
         stats.quit.store(false);
-
-        // Start mining dispatch (simple loop here)
-        dispatchMining(header, midstate, tail, target, stats);
+        dispatchMining(header, midstate, tail, targetVec, stats);
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

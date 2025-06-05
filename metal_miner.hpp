@@ -1,7 +1,8 @@
 #ifndef METAL_MINER_HPP
 #define METAL_MINER_HPP
 
-#include "block.hpp"  // Include the block header with full BlockHeader definition
+#include "block.hpp"
+#include <vector>
 
 bool metalMineBlock(
     const BlockHeader& header,
@@ -12,4 +13,3 @@ bool metalMineBlock(
     uint64_t& totalHashesTried);
 
 #endif // METAL_MINER_HPP
-

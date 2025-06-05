@@ -25,10 +25,8 @@ inline uint rotr(uint x, uint n) {
 }
 
 inline void sha256_compress(const device uint *midstate, device const uint8_t* tail, uint nonce, thread uint *output) {
-    // Prepare message schedule array w[64]
     uint w[64];
 
-    // Load midstate into working variables
     uint a = midstate[0];
     uint b = midstate[1];
     uint c = midstate[2];
@@ -38,34 +36,21 @@ inline void sha256_compress(const device uint *midstate, device const uint8_t* t
     uint g = midstate[6];
     uint h = midstate[7];
 
-    // Prepare tail block for compression (second block of SHA256)
-
-    // Tail is 16 bytes + nonce (4 bytes) + padding (44 bytes total)
-    // So total 64 bytes = 16 + 4 + 44
-
-    // Load first 16 bytes from tail
     for (uint i = 0; i < 4; i++) {
         w[i] = ((uint)tail[i*4]) | ((uint)tail[i*4+1] << 8) | ((uint)tail[i*4+2] << 16) | ((uint)tail[i*4+3] << 24);
     }
 
-    // Overwrite nonce bytes in w[4]
     w[4] = nonce;
+    w[5] = 0x80000000;
+    for (uint i = 6; i < 15; i++) w[i] = 0;
+    w[15] = 640;
 
-    // Padding for SHA256 second block (per standard)
-    w[5] = 0x80000000; // 0x80 followed by zeros
-    for (uint i = 6; i < 15; i++) {
-        w[i] = 0;
-    }
-    w[15] = 640; // Length in bits of total message (80 bytes * 8)
-
-    // Extend message schedule array
     for (uint i = 16; i < 64; i++) {
         uint s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
         uint s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
         w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
 
-    // Main compression loop
     for (uint i = 0; i < 64; i++) {
         uint S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         uint ch = (e & f) ^ ((~e) & g);
@@ -84,7 +69,6 @@ inline void sha256_compress(const device uint *midstate, device const uint8_t* t
         a = temp1 + temp2;
     }
 
-    // Add the compressed chunk to the current hash value
     output[0] = a + midstate[0];
     output[1] = b + midstate[1];
     output[2] = c + midstate[2];
@@ -99,18 +83,18 @@ kernel void mineKernel(const device uint* midstate,
                        const device uint8_t* tail,
                        const device uint8_t* target,
                        device atomic_uint* outputNonce,
-                       device atomic_bool* foundFlag,
+                       device uint8_t* resultHashes,
+                       constant uint& nonceBase, // ✅ NEW ARG at index 5
                        uint thread_id [[thread_position_in_grid]]) {
-    if (atomic_load_explicit(foundFlag, memory_order_relaxed)) {
-        return; // Already found, skip work
-    }
 
-    uint nonce = thread_id;
+    // ✅ Correct nonce based on batch offset
+    uint nonce = nonceBase + thread_id;
 
+    // Run SHA256 compression
     uint hash[8];
     sha256_compress(midstate, tail, nonce, hash);
 
-    // Convert hash to bytes for comparison (big-endian)
+    // Convert hash words to bytes
     uint8_t hashBytes[32];
     for (int i = 0; i < 8; i++) {
         hashBytes[i*4 + 0] = (hash[i] >> 24) & 0xFF;
@@ -119,21 +103,29 @@ kernel void mineKernel(const device uint* midstate,
         hashBytes[i*4 + 3] = hash[i] & 0xFF;
     }
 
-    // Compare to target (32 bytes big-endian)
+    // ✅ Always write thread 0's hash for sample display
+    if (thread_id == 0) {
+        for (uint i = 0; i < 32; i++) {
+            resultHashes[i] = hashBytes[i];
+        }
+    }
+
+    // Check hash against target
     bool isValid = true;
     for (int i = 0; i < 32; i++) {
         if (hashBytes[i] > target[i]) {
             isValid = false;
             break;
         }
-        if (hashBytes[i] < target[i]) {
-            break; // definitely less than target
-        }
+        if (hashBytes[i] < target[i]) break;
     }
 
+    // ✅ Write valid hash to result buffer (thread-specific offset)
     if (isValid) {
-        if (!atomic_exchange_explicit(foundFlag, true, memory_order_relaxed)) {
-            atomic_store_explicit(outputNonce, nonce, memory_order_relaxed);
+        if (atomic_exchange_explicit(outputNonce, nonce, memory_order_relaxed) == 0) {
+            for (uint i = 0; i < 32; i++) {
+                resultHashes[thread_id * 32 + i] = hashBytes[i];
+            }
         }
     }
 }
