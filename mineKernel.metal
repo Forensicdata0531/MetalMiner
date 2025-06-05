@@ -36,21 +36,29 @@ inline void sha256_compress(const device uint *midstate, device const uint8_t* t
     uint g = midstate[6];
     uint h = midstate[7];
 
+    // Load the first 4 words (16 bytes) from tail, little-endian
     for (uint i = 0; i < 4; i++) {
         w[i] = ((uint)tail[i*4]) | ((uint)tail[i*4+1] << 8) | ((uint)tail[i*4+2] << 16) | ((uint)tail[i*4+3] << 24);
     }
 
+    // Insert nonce at word index 4
     w[4] = nonce;
-    w[5] = 0x80000000;
-    for (uint i = 6; i < 15; i++) w[i] = 0;
-    w[15] = 640;
 
+    // Padding according to SHA256 spec
+    w[5] = 0x80000000;  // 1 bit followed by zeros
+    for (uint i = 6; i < 15; i++) {
+        w[i] = 0;
+    }
+    w[15] = 512 + 128;  // Length in bits of the message (512 + 128 bits)
+
+    // Message schedule extension
     for (uint i = 16; i < 64; i++) {
         uint s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
         uint s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
         w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
 
+    // Compression function main loop
     for (uint i = 0; i < 64; i++) {
         uint S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         uint ch = (e & f) ^ ((~e) & g);
@@ -69,6 +77,7 @@ inline void sha256_compress(const device uint *midstate, device const uint8_t* t
         a = temp1 + temp2;
     }
 
+    // Add the compressed chunk to current hash value
     output[0] = a + midstate[0];
     output[1] = b + midstate[1];
     output[2] = c + midstate[2];
@@ -85,8 +94,8 @@ kernel void mineKernel(const device uint* midstate,
                        device atomic_uint* outputNonce,
                        device uint8_t* resultHashes,
                        constant uint& nonceBase,
-                       uint thread_id [[thread_position_in_grid]]) {
-
+                       uint thread_id [[thread_position_in_grid]])
+{
     uint nonce = nonceBase + thread_id;
 
     uint hash[8];
@@ -94,18 +103,21 @@ kernel void mineKernel(const device uint* midstate,
 
     uint8_t hashBytes[32];
     for (int i = 0; i < 8; i++) {
-        hashBytes[i*4 + 0] = (hash[i] >> 24) & 0xFF;
-        hashBytes[i*4 + 1] = (hash[i] >> 16) & 0xFF;
-        hashBytes[i*4 + 2] = (hash[i] >> 8) & 0xFF;
-        hashBytes[i*4 + 3] = hash[i] & 0xFF;
+        // Convert each 32-bit word from big-endian to bytes (Bitcoin format)
+        hashBytes[i * 4 + 0] = (hash[i] >> 24) & 0xFF;
+        hashBytes[i * 4 + 1] = (hash[i] >> 16) & 0xFF;
+        hashBytes[i * 4 + 2] = (hash[i] >> 8) & 0xFF;
+        hashBytes[i * 4 + 3] = hash[i] & 0xFF;
     }
 
+    // Always write thread 0's hash to resultHashes buffer for UI sample display
     if (thread_id == 0) {
         for (uint i = 0; i < 32; i++) {
             resultHashes[i] = hashBytes[i];
         }
     }
 
+    // Check if hash is less than or equal to target (target is big-endian)
     bool isValid = true;
     for (int i = 0; i < 32; i++) {
         if (hashBytes[i] > target[i]) {
@@ -116,7 +128,9 @@ kernel void mineKernel(const device uint* midstate,
     }
 
     if (isValid) {
+        // Atomically set outputNonce if not already set
         if (atomic_exchange_explicit(outputNonce, nonce, memory_order_relaxed) == 0) {
+            // Write full valid hash at thread-specific offset in resultHashes buffer
             for (uint i = 0; i < 32; i++) {
                 resultHashes[thread_id * 32 + i] = hashBytes[i];
             }

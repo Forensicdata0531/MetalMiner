@@ -4,7 +4,6 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
-#include <simd/simd.h>
 
 void sha256(const uint8_t* data, size_t len, uint8_t* outHash);
 
@@ -41,6 +40,11 @@ bool metalMineBlock(const BlockHeader& header,
     id<MTLLibrary> library = [device newDefaultLibrary];
     id<MTLFunction> kernelFunction = [library newFunctionWithName:@"mineKernel"];
     id<MTLComputePipelineState> pipelineState = [device newComputePipelineStateWithFunction:kernelFunction error:&error];
+    if (!pipelineState) {
+        std::cerr << "Failed to create pipeline state: " << [[error localizedDescription] UTF8String] << std::endl;
+        return false;
+    }
+
     id<MTLCommandQueue> commandQueue = [device newCommandQueue];
 
     std::vector<uint8_t> headerData = serializeHeader80(header);
@@ -49,12 +53,13 @@ bool metalMineBlock(const BlockHeader& header,
     uint8_t midstateBytes[32];
     sha256(headerData.data(), 64, midstateBytes);
 
+    // Convert midstateBytes to little-endian uint32_t array
     uint32_t midstate[8];
     for (int i = 0; i < 8; ++i) {
-        midstate[i] = ((uint32_t)midstateBytes[i * 4] << 24) |
-                      ((uint32_t)midstateBytes[i * 4 + 1] << 16) |
-                      ((uint32_t)midstateBytes[i * 4 + 2] << 8) |
-                      ((uint32_t)midstateBytes[i * 4 + 3]);
+        midstate[i] = ((uint32_t)midstateBytes[i * 4]) |
+                      ((uint32_t)midstateBytes[i * 4 + 1] << 8) |
+                      ((uint32_t)midstateBytes[i * 4 + 2] << 16) |
+                      ((uint32_t)midstateBytes[i * 4 + 3] << 24);
     }
 
     uint8_t tail[16];
@@ -68,11 +73,19 @@ bool metalMineBlock(const BlockHeader& header,
                                                      length:sizeof(uint32_t)
                                                     options:MTLResourceStorageModeShared];
 
-    id<MTLBuffer> midstateBuffer = [device newBufferWithBytes:midstate length:sizeof(midstate) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> tailBuffer = [device newBufferWithBytes:tail length:sizeof(tail) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> targetBuffer = [device newBufferWithBytes:target.data() length:target.size() options:MTLResourceStorageModeShared];
-    id<MTLBuffer> resultNonceBuf = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> resultHashes = [device newBufferWithLength:threads * 32 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> midstateBuffer = [device newBufferWithBytes:midstate
+                                                       length:sizeof(midstate)
+                                                      options:MTLResourceStorageModeShared];
+    id<MTLBuffer> tailBuffer = [device newBufferWithBytes:tail
+                                                  length:sizeof(tail)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> targetBuffer = [device newBufferWithBytes:target.data()
+                                                    length:target.size()
+                                                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> resultNonceBuf = [device newBufferWithLength:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+    id<MTLBuffer> resultHashes = [device newBufferWithLength:threads * 32
+                                                   options:MTLResourceStorageModeShared];
 
     uint32_t zero = 0;
     memcpy(resultNonceBuf.contents, &zero, sizeof(uint32_t));
