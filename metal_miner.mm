@@ -4,8 +4,19 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
+#include <limits>
 
 void sha256(const uint8_t* data, size_t len, uint8_t* outHash);
+
+bool isHashLower(const uint32_t* a, const uint32_t* b) {
+    for (int i = 0; i < 8; ++i) {
+        uint32_t aBE = __builtin_bswap32(a[i]);
+        uint32_t bBE = __builtin_bswap32(b[i]);
+        if (aBE < bBE) return true;
+        if (aBE > bBE) return false;
+    }
+    return false;
+}
 
 std::vector<uint8_t> serializeHeader80(const BlockHeader& header) {
     std::vector<uint8_t> out;
@@ -34,7 +45,10 @@ bool metalMineBlock(const BlockHeader& header,
                     uint64_t& totalHashesTried)
 {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device) return false;
+    if (!device) {
+        std::cerr << "No Metal device found\n";
+        return false;
+    }
 
     NSError* error = nil;
     id<MTLLibrary> library = [device newDefaultLibrary];
@@ -48,12 +62,13 @@ bool metalMineBlock(const BlockHeader& header,
     id<MTLCommandQueue> commandQueue = [device newCommandQueue];
 
     std::vector<uint8_t> headerData = serializeHeader80(header);
-    if (headerData.size() != 80) return false;
+    if (headerData.size() != 80) {
+        std::cerr << "Header serialization incorrect size\n";
+        return false;
+    }
 
     uint8_t midstateBytes[32];
     sha256(headerData.data(), 64, midstateBytes);
-
-    // Convert midstateBytes to little-endian uint32_t array
     uint32_t midstate[8];
     for (int i = 0; i < 8; ++i) {
         midstate[i] = ((uint32_t)midstateBytes[i * 4]) |
@@ -62,30 +77,33 @@ bool metalMineBlock(const BlockHeader& header,
                       ((uint32_t)midstateBytes[i * 4 + 3] << 24);
     }
 
-    uint8_t tail[16];
-    memcpy(tail, headerData.data() + 64, 16);
+    uint32_t tail32[4];
+    for (int i = 0; i < 4; ++i) {
+        tail32[i] = ((uint32_t)headerData[64 + i * 4 + 0]) |
+                    ((uint32_t)headerData[64 + i * 4 + 1] << 8) |
+                    ((uint32_t)headerData[64 + i * 4 + 2] << 16) |
+                    ((uint32_t)headerData[64 + i * 4 + 3] << 24);
+    }
 
-    const uint32_t threads = 131072;
-    totalHashesTried = threads;
+    uint32_t target32[8];
+    for (int i = 0; i < 8; ++i) {
+        target32[i] = ((uint32_t)target[i * 4 + 0] << 24) |
+                      ((uint32_t)target[i * 4 + 1] << 16) |
+                      ((uint32_t)target[i * 4 + 2] << 8)  |
+                      ((uint32_t)target[i * 4 + 3]);
+    }
 
-    uint32_t nonceBase = initialNonceBase;
-    id<MTLBuffer> nonceBaseBuf = [device newBufferWithBytes:&nonceBase
-                                                     length:sizeof(uint32_t)
-                                                    options:MTLResourceStorageModeShared];
+    const uint32_t threadsPerDispatch = 131072;
+    const uint32_t dispatchCount = 8;
+    const uint32_t totalThreads = threadsPerDispatch * dispatchCount;
+    totalHashesTried = totalThreads;
 
-    id<MTLBuffer> midstateBuffer = [device newBufferWithBytes:midstate
-                                                       length:sizeof(midstate)
-                                                      options:MTLResourceStorageModeShared];
-    id<MTLBuffer> tailBuffer = [device newBufferWithBytes:tail
-                                                  length:sizeof(tail)
-                                                 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> targetBuffer = [device newBufferWithBytes:target.data()
-                                                    length:target.size()
-                                                   options:MTLResourceStorageModeShared];
-    id<MTLBuffer> resultNonceBuf = [device newBufferWithLength:sizeof(uint32_t)
-                                                     options:MTLResourceStorageModeShared];
-    id<MTLBuffer> resultHashes = [device newBufferWithLength:threads * 32
-                                                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> midstateBuffer = [device newBufferWithBytes:midstate length:sizeof(midstate) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> tailBuffer     = [device newBufferWithBytes:tail32  length:sizeof(tail32)  options:MTLResourceStorageModeShared];
+    id<MTLBuffer> targetBuffer   = [device newBufferWithBytes:target32 length:sizeof(target32) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> resultNonceBuf = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> resultHashes   = [device newBufferWithLength:totalThreads * sizeof(uint32_t) * 8 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> nonceBaseBuf   = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
 
     uint32_t zero = 0;
     memcpy(resultNonceBuf.contents, &zero, sizeof(uint32_t));
@@ -95,35 +113,71 @@ bool metalMineBlock(const BlockHeader& header,
 
     [encoder setComputePipelineState:pipelineState];
     [encoder setBuffer:midstateBuffer offset:0 atIndex:0];
-    [encoder setBuffer:tailBuffer offset:0 atIndex:1];
-    [encoder setBuffer:targetBuffer offset:0 atIndex:2];
+    [encoder setBuffer:tailBuffer     offset:0 atIndex:1];
+    [encoder setBuffer:targetBuffer   offset:0 atIndex:2];
     [encoder setBuffer:resultNonceBuf offset:0 atIndex:3];
-    [encoder setBuffer:resultHashes offset:0 atIndex:4];
-    [encoder setBuffer:nonceBaseBuf offset:0 atIndex:5];
+    [encoder setBuffer:resultHashes   offset:0 atIndex:4];
+    [encoder setBuffer:nonceBaseBuf   offset:0 atIndex:5];
+    [encoder setThreadgroupMemoryLength:sizeof(uint32_t) * (64 + 4 + 8) atIndex:0];
 
-    MTLSize gridSize = MTLSizeMake(threads, 1, 1);
     NSUInteger threadGroupSize = pipelineState.maxTotalThreadsPerThreadgroup;
-    if (threadGroupSize > threads) threadGroupSize = threads;
+    if (threadGroupSize > threadsPerDispatch) threadGroupSize = threadsPerDispatch;
     MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
 
-    [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    for (uint32_t i = 0; i < dispatchCount; ++i) {
+        uint32_t nonceBase = initialNonceBase + i * threadsPerDispatch;
+        MTLSize gridSize = MTLSizeMake(threadsPerDispatch, 1, 1);
+        memcpy(nonceBaseBuf.contents, &nonceBase, sizeof(uint32_t));
+        [encoder setBuffer:nonceBaseBuf offset:0 atIndex:5];
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    }
+
     [encoder endEncoding];
     [commandBuffer commit];
     [commandBuffer waitUntilCompleted];
 
-    uint32_t foundNonce = *((uint32_t*)resultNonceBuf.contents);
-    const uint8_t* hashStart = (uint8_t*)resultHashes.contents;
+    const uint32_t* hashStart = (const uint32_t*)resultHashes.contents;
+    const uint32_t* bestHash = hashStart;
+    uint32_t bestIndex = 0;
 
-    if (foundNonce != 0 && foundNonce < threads) {
-        validNonce = foundNonce + nonceBase;
-        validHash.assign(
-            hashStart + (foundNonce * 32),
-            hashStart + (foundNonce * 32 + 32)
-        );
+    for (uint32_t i = 1; i < totalThreads; ++i) {
+        const uint32_t* current = hashStart + i * 8;
+        if (isHashLower(current, bestHash)) {
+            bestHash = current;
+            bestIndex = i;
+        }
+    }
+
+    printf("[DEBUG] Best Sample Hash [%u]: ", bestIndex);
+    for (int i = 0; i < 8; ++i) {
+        uint32_t be = __builtin_bswap32(bestHash[i]);
+        printf("%02x%02x%02x%02x", (be >> 24), (be >> 16) & 0xff, (be >> 8) & 0xff, be & 0xff);
+    }
+    printf("\n");
+
+    uint32_t foundNonce = *((uint32_t*)resultNonceBuf.contents);
+    if (foundNonce != 0 && foundNonce < totalThreads) {
+        validNonce = foundNonce + initialNonceBase;
+        const uint32_t* validHashPtr = hashStart + foundNonce * 8;
+        validHash.resize(32);
+        for (int i = 0; i < 8; ++i) {
+            uint32_t word = __builtin_bswap32(validHashPtr[i]);
+            validHash[i * 4 + 0] = (word >> 24) & 0xFF;
+            validHash[i * 4 + 1] = (word >> 16) & 0xFF;
+            validHash[i * 4 + 2] = (word >> 8) & 0xFF;
+            validHash[i * 4 + 3] = word & 0xFF;
+        }
         return true;
     } else {
         validNonce = 0;
-        validHash.assign(hashStart, hashStart + 32);
+        validHash.resize(32);
+        for (int i = 0; i < 8; ++i) {
+            uint32_t word = __builtin_bswap32(bestHash[i]);
+            validHash[i * 4 + 0] = (word >> 24) & 0xFF;
+            validHash[i * 4 + 1] = (word >> 16) & 0xFF;
+            validHash[i * 4 + 2] = (word >> 8) & 0xFF;
+            validHash[i * 4 + 3] = word & 0xFF;
+        }
         return false;
     }
 }
